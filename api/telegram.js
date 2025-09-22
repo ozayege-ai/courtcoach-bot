@@ -1,11 +1,14 @@
 // /api/telegram.js
 
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const TELEGRAM_API = (m) => `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/${m}`;
+
 export default async function handler(req, res) {
   try {
-    // Log the HTTP method so we can see POSTs arriving
+    // Log method
     console.log("Incoming request method:", req.method);
 
-    // Read the raw body (Telegram sends JSON via POST)
+    // Read raw body (Telegram JSON)
     const rawBody = await new Promise((resolve, reject) => {
       let body = "";
       req.on("data", (chunk) => { body += chunk; });
@@ -15,11 +18,31 @@ export default async function handler(req, res) {
 
     console.log("Raw body length:", rawBody ? rawBody.length : 0);
 
-    // Always return 200 OK so Telegram doesn't record a 500
-    return res.status(200).json({ ok: true, note: "logger reached" });
-  } catch (e) {
-    console.error("Logger handler error:", e);
-    // Still return 200 so Telegram doesn't retry
-    return res.status(200).json({ ok: true, note: "caught error" });
-  }
-}
+    // Parse JSON safely
+    let update = {};
+    try {
+      update = JSON.parse(rawBody || "{}");
+    } catch (e) {
+      console.error("JSON parse error:", e);
+      // Acknowledge to stop Telegram retries
+      return res.status(200).json({ ok: true, note: "bad json, but acknowledged" });
+    }
+
+    const msg = update?.message;
+    const chatId = msg?.chat?.id;
+    const text = (msg?.text || "").trim().toLowerCase();
+
+    // If we got a chat id, try to reply
+    if (chatId && TELEGRAM_BOT_TOKEN) {
+      const replyText = (text === "echo")
+        ? "Echo ✅ — webhook path working end-to-end"
+        : "I’m online ✅ — send 'echo' to confirm.";
+
+      const tgRes = await fetch(TELEGRAM_API("sendMessage"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ chat_id: chatId, text: replyText })
+      });
+
+      if (!tgRes.ok) {
+        const errText = await tgRes.text();
