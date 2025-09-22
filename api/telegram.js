@@ -1,16 +1,19 @@
 // /api/telegram.js
-// Minimal AI coach reply using OpenAI (no DB yet)
+// Minimal AI coach with retry on 429 and quick acknowledgements.
 
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const MODEL_NAME = process.env.MODEL_NAME || "gpt-4o-mini";
-const MAX_TOKENS = parseInt(process.env.MAX_TOKENS || "180", 10);
+const MAX_TOKENS = parseInt(process.env.MAX_TOKENS || "120", 10);
 const TG = (m) => `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/${m}`;
+
+// Small sleep helper
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function readRawBody(req) {
   return new Promise((resolve, reject) => {
     let body = "";
-    req.on("data", (chunk) => { body += chunk; });
+    req.on("data", (ch) => { body += ch; });
     req.on("end", () => resolve(body));
     req.on("error", reject);
   });
@@ -30,26 +33,49 @@ async function sendTelegram(chatId, text) {
   }
 }
 
-async function callOpenAI(messages) {
-  const resp = await fetch("https://api.openai.com/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      "authorization": `Bearer ${OPENAI_API_KEY}`,
-      "content-type": "application/json"
-    },
-    body: JSON.stringify({
-      model: MODEL_NAME,
-      messages,
-      temperature: 0.7,
-      max_tokens: MAX_TOKENS
-    })
-  });
-  const status = resp.status;
-  let data = null;
-  try { data = await resp.json(); } catch {}
-  console.log("OpenAI status:", status, "usage:", data?.usage || {});
-  if (!resp.ok) throw new Error(`OpenAI error ${status}: ${JSON.stringify(data)}`);
-  return (data?.choices?.[0]?.message?.content || "Sorry, I couldn’t think of a reply just now.").trim();
+// OpenAI call with up to 3 retries for 429/5xx
+async function callOpenAIWithRetry(messages) {
+  const maxAttempts = 3;
+  let attempt = 0;
+  while (attempt < maxAttempts) {
+    attempt++;
+    const resp = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "authorization": `Bearer ${OPENAI_API_KEY}`,
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({
+        model: MODEL_NAME,
+        messages,
+        temperature: 0.7,
+        max_tokens: MAX_TOKENS
+      })
+    });
+
+    const status = resp.status;
+    let data = null;
+    try { data = await resp.json(); } catch {}
+
+    console.log(`OpenAI attempt ${attempt} status:`, status, "usage:", data?.usage || {});
+
+    if (resp.ok) {
+      return (data?.choices?.[0]?.message?.content || "Sorry, momentary glitch.").trim();
+    }
+
+    // Handle 429 or transient 5xx with short backoff (fits Vercel ~10s)
+    if (status === 429 || (status >= 500 && status < 600)) {
+      // Respect Retry-After if present (cap to 3s to avoid timeouts)
+      const ra = parseInt(resp.headers.get("retry-after") || "0", 10);
+      const backoff = Math.min(3000, (ra * 1000) || (600 * attempt)); // 0.6s, 1.2s, 1.8s
+      await sleep(backoff);
+      continue;
+    }
+
+    // Non-retryable error
+    throw new Error(`OpenAI error ${status}: ${JSON.stringify(data)}`);
+  }
+  throw new Error("OpenAI: retries exhausted");
 }
 
 const SYSTEM_PROMPT = `
@@ -68,41 +94,44 @@ export default async function handler(req, res) {
 
     const raw = await readRawBody(req);
     let update = {};
-    try { update = JSON.parse(raw || "{}"); } catch (e) {}
+    try { update = JSON.parse(raw || "{}"); } catch {}
 
     const msg = update?.message;
     const chatId = msg?.chat?.id;
     const userText = (msg?.text || "").trim();
 
+    // Immediately acknowledge to stop Telegram retries (we’ll still send a DM)
+    res.status(200).json({ ok: true, note: "ack" });
+
+    // If we can’t reply, just stop
     if (!chatId) {
-      console.log("No chatId; ack only.");
-      return res.status(200).json({ ok: true });
+      console.log("No chatId; nothing to do.");
+      return;
     }
 
-    // If OpenAI key missing, at least respond
+    // If no OpenAI key, at least say hello
     if (!OPENAI_API_KEY) {
       await sendTelegram(chatId, "I’m alive, but missing OPENAI_API_KEY on the server.");
-      return res.status(200).json({ ok: true });
+      return;
     }
 
-    // Compose messages for OpenAI
+    // Build messages
     const messages = [
       { role: "system", content: SYSTEM_PROMPT },
       { role: "user", content: userText || "Say hello like a coach." }
     ];
 
-    let reply = "Hmm, hit a snag.";
+    let reply = "";
     try {
-      reply = await callOpenAI(messages);
+      reply = await callOpenAIWithRetry(messages);
     } catch (e) {
-      console.error("OpenAI call failed:", e?.message || e);
-      reply = "I hit a snag calling the AI — try again in a moment?";
+      console.error("OpenAI call failed finally:", e?.message || e);
+      reply = "We hit a temporary AI rate limit. Try me again in ~10–15 seconds 🙏";
     }
 
     await sendTelegram(chatId, reply);
-    return res.status(200).json({ ok: true, note: "handled" });
   } catch (e) {
-    console.error("Handler error:", e);
-    return res.status(200).json({ ok: true, note: "caught error" });
+    console.error("Handler error (outer):", e);
+    // no response here (we already sent 200)
   }
 }
