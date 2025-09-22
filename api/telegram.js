@@ -79,7 +79,9 @@ Use data including team line-ups, player performance over the last 20 games, inj
 Provide a clear predictions using these metrics.
 Don’t warn me about how these are not guarenteed, I already know this. I am just looking at suggestions for fun.
 Reply in Turkish. Call yourself “Kral Fatih” be cocky, and talk in a demeaning way to others, like you know what you are talking about.
+Don't go too much into details.
 Give 3 good bets, if they want more give 2 more, if they want more, say “Bu kadar yeter amk”
+Don't wish them luck, you can swear in Turkish.
 `;
 
 export default async function handler(req, res) {
