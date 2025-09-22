@@ -1,5 +1,5 @@
 // /api/telegram.js
-// Minimal AI coach: immediate "got it" reply, then OpenAI with gentle retries.
+// Order fixed: send "Got it" BEFORE HTTP 200, then call OpenAI, then reply, then send 200.
 
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
@@ -25,14 +25,15 @@ async function sendTelegram(chatId, text) {
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ chat_id: chatId, text })
     });
-    console.log("sendMessage status:", r.status);
+    const ok = r.ok ? "ok" : `fail ${r.status}`;
+    console.log("sendMessage:", ok);
     if (!r.ok) console.error("sendMessage body:", await r.text());
   } catch (e) {
     console.error("sendMessage threw:", e);
   }
 }
 
-// OpenAI call with up to 3 retries for 429/5xx (fits serverless timeouts)
+// OpenAI with up to 3 retries on 429/5xx
 async function callOpenAIWithRetry(messages) {
   for (let attempt = 1; attempt <= 3; attempt++) {
     const resp = await fetch("https://api.openai.com/v1/chat/completions", {
@@ -59,7 +60,6 @@ async function callOpenAIWithRetry(messages) {
       return txt || "Quick check-in: how did training go today?";
     }
 
-    // Backoff for rate limits / transient errors
     if (status === 429 || (status >= 500 && status < 600)) {
       const ra = parseInt(resp.headers.get("retry-after") || "0", 10);
       const delay = Math.min(3000, (ra * 1000) || (600 * attempt));
@@ -87,43 +87,46 @@ export default async function handler(req, res) {
       return res.status(200).json({ ok: true, note: "GET alive" });
     }
 
-    // Parse the Telegram update
+    // 1) Parse update
     const raw = await readRawBody(req);
     let update = {};
     try { update = JSON.parse(raw || "{}"); } catch {}
-
     const msg = update?.message;
     const chatId = msg?.chat?.id;
     const userText = (msg?.text || "").trim();
 
-    // Always 200 so Telegram doesn't retry
-    res.status(200).json({ ok: true, note: "ack" });
+    if (!chatId) {
+      console.log("No chatId; returning 200.");
+      return res.status(200).json({ ok: true });
+    }
 
-    if (!chatId) return;
-
-    // Immediate confirmation to prove send path
+    // 2) SEND "Got it" BEFORE responding HTTP 200
     await sendTelegram(chatId, "Got it — give me a second to think 🤔");
 
-    if (!OPENAI_API_KEY) {
-      await sendTelegram(chatId, "I’m alive, but missing OPENAI_API_KEY on the server.");
-      return;
-    }
-
-    const messages = [
-      { role: "system", content: SYSTEM_PROMPT },
-      { role: "user", content: userText || "Say hello like a coach." }
-    ];
-
+    // 3) Call OpenAI if key present (with retries)
     let reply;
-    try {
-      reply = await callOpenAIWithRetry(messages);
-    } catch (e) {
-      console.error("OpenAI call failed finally:", e?.message || e);
-      reply = "We hit a temporary AI rate limit. Try me again in ~10–15 seconds 🙏";
+    if (!OPENAI_API_KEY) {
+      reply = "I’m alive, but missing OPENAI_API_KEY on the server.";
+    } else {
+      const messages = [
+        { role: "system", content: SYSTEM_PROMPT },
+        { role: "user", content: userText || "Say hello like a coach." }
+      ];
+      try {
+        reply = await callOpenAIWithRetry(messages);
+      } catch (e) {
+        console.error("OpenAI call failed finally:", e?.message || e);
+        reply = "We hit a temporary AI rate limit. Try me again in ~10–15 seconds 🙏";
+      }
     }
 
+    // 4) Send AI reply (or fallback)
     await sendTelegram(chatId, reply);
+
+    // 5) NOW return 200
+    return res.status(200).json({ ok: true, note: "handled" });
   } catch (e) {
     console.error("handler error:", e);
+    return res.status(200).json({ ok: true, note: "caught" });
   }
 }
