@@ -108,7 +108,7 @@ export default async function handler(req, res) {
     }
 
     // 2) SEND "Got it" BEFORE responding HTTP 200
-    await sendTelegram(chatId, "Dusunuyorum amk bekle.");
+    await sendTelegram(chatId, "---");
 
     // 3) Call OpenAI if key present (with retries)
     let reply;
