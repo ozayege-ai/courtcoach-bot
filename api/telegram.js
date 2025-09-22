@@ -1,37 +1,52 @@
 // /api/telegram.js
-// Acknowledge 200 immediately, then send a hardcoded DM to verify webhook → sendMessage path.
+// Parse Telegram update safely; reply to the sending chatId.
 
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TG = (m) => `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/${m}`;
 
-// Your chat id from earlier logs:
-const TEST_CHAT_ID = 6563253501;
+function readRawBody(req) {
+  return new Promise((resolve, reject) => {
+    let body = "";
+    req.on("data", (ch) => { body += ch; });
+    req.on("end", () => resolve(body));
+    req.on("error", reject);
+  });
+}
 
 async function sendTelegram(chatId, text) {
-  try {
-    const r = await fetch(TG("sendMessage"), {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ chat_id: chatId, text })
-    });
-    if (!r.ok) {
-      const t = await r.text();
-      console.error("sendMessage failed:", r.status, t);
-    }
-  } catch (e) {
-    console.error("sendMessage threw:", e);
+  const r = await fetch(TG("sendMessage"), {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ chat_id: chatId, text })
+  });
+  if (!r.ok) {
+    const t = await r.text();
+    console.error("sendMessage failed:", r.status, t);
   }
 }
 
 export default async function handler(req, res) {
   try {
-    // Always 200 so Telegram stops reporting 500s
-    res.status(200).json({ ok: true, note: "ack" });
+    // Always ack immediately so Telegram doesn’t retry
+    res.status(200).json({ ok: true });
 
-    // Immediately DM you regardless of body content
-    if (TELEGRAM_BOT_TOKEN) {
-      await sendTelegram(TEST_CHAT_ID, "Diagnostic ping ✅ (webhook OK)");
-    }
+    if (req.method !== "POST") return;
+
+    // Read & parse
+    const raw = await readRawBody(req);
+    let update = {};
+    try { update = JSON.parse(raw || "{}"); } catch {}
+
+    const chatId = update?.message?.chat?.id;
+    const text = (update?.message?.text || "").trim().toLowerCase();
+
+    if (!TELEGRAM_BOT_TOKEN || !chatId) return;
+
+    const reply = text === "echo"
+      ? "Echo ✅ — body parsed and replied."
+      : "I’m online ✅ — send 'echo' to confirm.";
+
+    await sendTelegram(chatId, reply);
   } catch (e) {
     console.error("Handler error:", e);
   }
